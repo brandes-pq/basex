@@ -1,15 +1,16 @@
 package org.basex.query.func;
 
 import static java.lang.String.format;
+import static java.util.stream.Collectors.joining;
 import static org.basex.query.QueryError.*;
 import static org.basex.query.func.Function.*;
+
+import org.basex.query.QueryError;
 
 import java.io.*;
 import java.nio.file.FileSystems;
 import java.nio.file.Path;
-import java.util.HashSet;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 
 import org.basex.*;
 import org.basex.util.*;
@@ -83,43 +84,81 @@ public final class ProcModuleTest extends SandboxTest {
 
     // test encoding option
     error(func.args("java", "-version", " map { 'encoding': 'xx' }"), PROC_ENCODING_X);
-    query(func.args("java",
-                    format(" ('-cp', 'target/test-classes', '%s', 'UTF-16')", writeEnc.class.getName()),
-                    " map { 'encoding': 'UTF-16'}"),
-            "\u03b1\n");
-    query(func.args("java",
-                    format(" ('-cp', 'target/test-classes', '%s', 'UTF-8')", writeEnc.class.getName()),
-                    " map { 'encoding': 'UTF-8'}"),
-            "\u03b1\n");
+    query(proc(writeEnc.class, "UTF-16"), "'encoding': 'UTF-16'", "\u03b1\n", func);
+    query(proc(writeEnc.class, "UTF-8"), "'encoding': 'UTF-8'", "\u03b1\n", func);
 
     // test environment option
-    query(func.args("java",
-                    format(" ('-cp', 'target/test-classes', '%s')", env.class.getName()),
-                    " map { 'environment': map { 'FOO': 'bar' }}"),
-            "FOO=bar\n");
+    query(proc(env.class), "'environment': map { 'FOO': 'bar' }", "FOO=bar\n", func);
 
     // test timeout option
-    error(func.args("java",
-                    format(" ('-cp', 'target/test-classes', '%s', '2')", sleep.class.getName()),
-                    " map { 'timeout': '1'}"),
-            PROC_TIMEOUT);
-    query(func.args("java",
-                  format(" ('-cp', 'target/test-classes', '%s', '0')", sleep.class.getName()),
-                  " map { 'timeout': '10'}"),
-            "");
- 
+    error(proc(sleep.class, "2"), "'timeout': 1", PROC_TIMEOUT, func);
+    query(proc(sleep.class, "0"), "'timeout': 10", "", func);
+
     // test dir option
     Path dir = FileSystems.getDefault().getRootDirectories().iterator().next();
-    Path testClassPath = Path.of("target/test-classes").toAbsolutePath();
     assert !dir.toString().contains("'");
-    assert !testClassPath.toString().contains("'");
-    query(func.args("java",
-                    format(" ('-cp', '%s', '%s')", testClassPath, pwd.class.getName()),
-                    format(" map { 'dir': '%s' }", dir)),
-            dir + "\n");
+    query(proc(pwd.class), "'dir': '" + dir + "'", dir + "\n", func);
+    error(proc(pwd.class), "'dir': ''", PROC_ERROR_X, func);
   }
 
-  // used as external process in proc:system tests.
+  static class ProcDescr {
+    final Class<?> mainClass;
+    final String[] args;
+
+    public ProcDescr(Class<?> mainClass, String[] args) {
+      assert Arrays.stream(args).noneMatch(a -> a.contains("'"));
+      this.mainClass = mainClass;
+      this.args = args;
+    }
+  }
+
+  /**
+   * Describe a call to an external java process
+   *
+   * @param mainClass must be defined in src/test/java and include a main method
+   * @param args      arguments must not contain an apostrophe
+   */
+  private static ProcDescr proc(Class<?> mainClass, String... args) {
+    return new ProcDescr(mainClass, args);
+  }
+
+  private static void query(ProcDescr proc, String options, String expected, Function func) {
+    String query = buildQuery(proc, options, func);
+    query(query, expected);
+  }
+
+  private static void error(ProcDescr proc, String options, QueryError expected, Function func) {
+    String query = buildQuery(proc, options, func);
+    error(query, expected);
+  }
+
+  /**
+   * Build a query that runs a Java class as external process with proc:system/execute/fork
+   *
+   * @param process     the process to start
+   * @param options     will be wrapped with "map { ... }"
+   * @param func        the xquery function to use
+   */
+  private static String buildQuery(ProcDescr process, String options, Function func) {
+    Path classPath = Path.of("target/test-classes").toAbsolutePath();
+    assert !classPath.toString().contains("'");
+
+    List<String> javaArgs = new ArrayList<>(List.of(
+            "-cp", classPath.toString(),
+            process.mainClass.getName()
+    ));
+    javaArgs.addAll(List.of(process.args));
+
+    String args = format(" ( %s )",
+            javaArgs.stream().map(a -> format("'%s'", a)).collect(joining(", ")));
+
+    return options.isEmpty() ? func.args("java", args) :
+            func.args("java", args, format(" map { %s }", options));
+  }
+
+  /**
+   * write the letter "alpha" to stdout; the first argument is the output encoding
+   */
   public static class writeEnc {
     public static void main(String[] args) throws InterruptedException, UnsupportedEncodingException {
       String enc = args[0];
@@ -129,7 +168,7 @@ public final class ProcModuleTest extends SandboxTest {
     }
   }
 
-  // used as external process in proc:system tests.
+  /** dump the environment to stdout */
   public static class env {
     public static void main(String[] args) {
 
@@ -142,22 +181,21 @@ public final class ProcModuleTest extends SandboxTest {
       ignoreVars.add("SystemRoot");
 
       for (Map.Entry<String, String> e : System.getenv().entrySet()) {
-        if (ignoreVars.contains(e.getKey())) {
-          continue;
+        if (!ignoreVars.contains(e.getKey())) {
+          System.out.println(e.getKey() + "=" + e.getValue());
         }
-        System.out.println(e.getKey() + "=" + e.getValue());
       }
     }
   }
 
-  // used as external process in proc:system tests.
+  /** write the current working directory to stdout */
   public static class pwd {
     public static void main(String[] args) {
       System.out.println(System.getProperty("user.dir"));
     }
   }
 
-  // used as external process in proc:system tests.
+  /** sleep for the number of seconds given in the first argument */
   public static class sleep {
     public static void main(String[] args) throws InterruptedException {
       Thread.sleep(1000 * Long.parseLong(args[0]));
